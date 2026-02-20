@@ -23,6 +23,8 @@ class Config:
     middle_mouse_drag_threshold: float = 8.0
     mouse_wheel_scroll_multiplier: float = 1.0  # < 1.0 to slow down, > 1.0 to speed up
     pause_audio_while_recording: bool = False
+    capture_archive_enabled: bool = False
+    capture_archive_dir: str = "~/.config/clickspeak/captures"
 
 
 def load_config() -> Config:

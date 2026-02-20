@@ -10,7 +10,10 @@ import platform
 import ctypes
 import ctypes.util
 import sys
+import wave
+from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import objc
@@ -264,6 +267,11 @@ class ClickSpeakApp(rumps.App):
             callback=self._toggle_pause_audio,
         )
         self.pause_audio_item.state = self.config.pause_audio_while_recording
+        self.capture_archive_item = rumps.MenuItem(
+            "Capture Archive Mode",
+            callback=self._toggle_capture_archive,
+        )
+        self.capture_archive_item.state = self.config.capture_archive_enabled
         self._did_pause_audio = False
 
         self.menu = [
@@ -274,6 +282,7 @@ class ClickSpeakApp(rumps.App):
             None,  # separator
             self.shortcut_info,
             self.pause_audio_item,
+            self.capture_archive_item,
             self.mode_menu,
             self.device_menu,
             None,  # separator
@@ -449,6 +458,11 @@ class ClickSpeakApp(rumps.App):
     def _toggle_pause_audio(self, sender) -> None:
         sender.state = not sender.state
         self.config.pause_audio_while_recording = bool(sender.state)
+        save_config(self.config)
+
+    def _toggle_capture_archive(self, sender) -> None:
+        sender.state = not sender.state
+        self.config.capture_archive_enabled = bool(sender.state)
         save_config(self.config)
 
     @staticmethod
@@ -1229,6 +1243,24 @@ class ClickSpeakApp(rumps.App):
         except Exception:
             logger.exception("Failed to send scroll event")
 
+    def _archive_capture_audio(self, audio: np.ndarray) -> None:
+        if not self.config.capture_archive_enabled or len(audio) == 0:
+            return
+        try:
+            archive_dir = Path(os.path.expanduser(self.config.capture_archive_dir))
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            capture_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            capture_path = archive_dir / f"capture-{capture_id}-{uuid4().hex[:6]}.wav"
+            pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+            with wave.open(str(capture_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(self.config.sample_rate)
+                wav_file.writeframes(pcm16.tobytes())
+            logger.info("Saved capture archive: %s", capture_path)
+        except Exception:
+            logger.exception("Failed to save capture archive")
+
     # ── Audio pipeline ───────────────────────────────────────
 
     def _on_audio_chunk(self, chunk: np.ndarray) -> None:
@@ -1283,6 +1315,7 @@ class ClickSpeakApp(rumps.App):
         self.vad.enabled = False
         self.wake_word.set_threshold(self.config.wake_word_threshold)  # restore normal threshold
         audio = self.audio.stop_recording()
+        self._archive_capture_audio(audio)
         self._play_sound("Funk")
         logger.info("SPEECH_END: captured %d samples (%.1fs)", len(audio), len(audio) / self.config.sample_rate if len(audio) > 0 else 0)
 
