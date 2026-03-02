@@ -30,7 +30,8 @@ Tools like SuperWhisper ($10/mo) charge a subscription for open-source models an
 ## Features
 
 ### Mouse-only workflow
-- **Middle click** to start/stop recording — no keyboard shortcut needed
+- **Single middle click** to start/stop recording — no keyboard shortcut needed
+- **Double middle click** is ignored so other apps can bind it safely
 - **Middle click + drag** for fast scrolling (configurable multiplier)
 - **Scroll wheel multiplier** for discrete mouse wheels (trackpad unaffected)
 - **Auto-focuses the window under your cursor** before pasting — no need to click first, text always lands in the right place
@@ -106,9 +107,9 @@ bash scripts/install_app.sh
 ### Middle mouse workflow (recommended)
 
 1. Point your cursor at any text field
-2. **Middle-click** to start recording (Glass sound plays)
+2. **Single middle-click** to start recording (Glass sound plays)
 3. Speak your text
-4. **Middle-click** to stop (Funk sound plays), or say the wake word, or just pause and let VAD detect the silence
+4. **Single middle-click** to stop (Funk sound plays), or say the wake word, or just pause and let VAD detect the silence
 5. ClickSpeak clicks the window under your cursor to focus it, pastes the text, and presses Enter
 
 ### Wake word

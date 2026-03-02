@@ -258,7 +258,7 @@ class ClickSpeakApp(rumps.App):
 
         # Shortcut info (read-only, reflects actual bindings)
         self.shortcut_info = rumps.MenuItem("Shortcuts")
-        self.shortcut_info.add(rumps.MenuItem("Middle Mouse Click — start/stop recording"))
+        self.shortcut_info.add(rumps.MenuItem("Single Middle Mouse Click — start/stop recording"))
         self.shortcut_info.add(rumps.MenuItem("Option+Space — start/stop recording"))
         self.shortcut_info.add(rumps.MenuItem("Middle Mouse Drag — fast scroll"))
 
@@ -294,9 +294,15 @@ class ClickSpeakApp(rumps.App):
         self._middle_mouse_initial_pos: tuple[float, float] | None = None
         self._middle_mouse_scroll_mode = False
         self._middle_mouse_timer: threading.Timer | None = None
+        self._middle_click_timer: threading.Timer | None = None
+        # Confirm a single click only after the double-click window expires.
+        self._middle_click_delay_s = 0.25
+        self._middle_click_lock = threading.Lock()
 
         # ── Startup ──────────────────────────────────────────
-        self._hotkey_listener = None  # NSEvent global monitor handle
+        self._hotkey_listener = None  # NSEvent global monitor handle (fallback)
+        self._hotkey_event_tap = None  # CGEventTap (preferred, can suppress Option+Space)
+        self._hotkey_event_tap_callback = None
         self._mouse_listener = None  # NSEvent global monitor handle
         self._audio_device_listener_registered = False
         self._device_available = False  # configured device is actually producing audio
@@ -306,6 +312,10 @@ class ClickSpeakApp(rumps.App):
         self._start_hotkey_listener()
         self._start_mouse_listener()
         self._device_poll_timer: threading.Timer | None = None
+        self._recording_watchdog_timer: threading.Timer | None = None
+        self._recording_started_at: float = 0.0
+        self._recording_had_nonzero_audio = False
+        self._recording_interrupted_by_device_loss = False
         self._start_scroll_wheel_modifier()
         self._start_audio_device_listener()
 
@@ -645,6 +655,7 @@ class ClickSpeakApp(rumps.App):
             self.audio.stop()
         except Exception:
             logger.exception("Failed to stop audio")
+        self._stop_recording_watchdog()
         self._listening = False
         self._recording = False
         self.listening_item.title = "Start Listening"
@@ -774,6 +785,69 @@ class ClickSpeakApp(rumps.App):
         if self.config.audio_device and not self._device_available:
             self._try_fast_reconnect()
 
+    # ── Recording watchdog ────────────────────────────────
+
+    def _start_recording_watchdog(self) -> None:
+        """While recording, detect dead input and stop immediately."""
+        self._stop_recording_watchdog()
+
+        def _poll():
+            if self._shutting_down or not self._recording:
+                return
+
+            now = time.monotonic()
+            callback_stalled = (
+                self.audio.last_callback_time > 0
+                and now - self.audio.last_callback_time > 2.5
+                and now - self._recording_started_at > 3.0
+            )
+            zero_only_stream = (
+                self._recording_had_nonzero_audio
+                and self.audio.last_nonzero_time > 0
+                and now - self.audio.last_nonzero_time > 5.0
+            )
+
+            if callback_stalled or zero_only_stream:
+                reason = "audio callback stalled" if callback_stalled else "all-zero input for >5s"
+                logger.warning("Recording input lost (%s)", reason)
+                self._run_on_main(lambda r=reason: self._on_recording_input_lost(r))
+                return
+
+            if not self._shutting_down and self._recording:
+                self._recording_watchdog_timer = threading.Timer(1.0, _poll)
+                self._recording_watchdog_timer.daemon = True
+                self._recording_watchdog_timer.start()
+
+        self._recording_watchdog_timer = threading.Timer(1.0, _poll)
+        self._recording_watchdog_timer.daemon = True
+        self._recording_watchdog_timer.start()
+
+    def _stop_recording_watchdog(self) -> None:
+        timer = self._recording_watchdog_timer
+        self._recording_watchdog_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    @staticmethod
+    def _notify_user(title: str, message: str) -> None:
+        try:
+            rumps.notification(APP_DISPLAY_NAME, title, message)
+        except Exception:
+            logger.exception("Failed to send notification")
+
+    def _on_recording_input_lost(self, reason: str) -> None:
+        if not self._recording:
+            return
+        logger.warning("Recording interrupted: %s", reason)
+        self._recording_interrupted_by_device_loss = True
+        if self.config.audio_device:
+            self._device_available = False
+        self._notify_user(
+            "Mic Signal Lost",
+            "Recording stopped because microphone audio was no longer being captured.",
+        )
+        self._on_speech_end(device_lost=True)
+
     # ── Device heartbeat polling ─────────────────────────
 
     def _start_device_poll(self) -> None:
@@ -894,10 +968,14 @@ class ClickSpeakApp(rumps.App):
 
     def _on_device_lost(self) -> None:
         """Audio stream is dead — device effectively disconnected."""
+        if self._recording:
+            self._on_recording_input_lost("device heartbeat lost")
+            return
         logger.warning("Device '%s' lost — pausing, will auto-reconnect",
                        self.config.audio_device)
         self._device_available = False
         self._poll_reconnect_phase = 0
+        self._stop_recording_watchdog()
         try:
             self.audio.stop()
         except Exception:
@@ -934,11 +1012,11 @@ class ClickSpeakApp(rumps.App):
     # ── Hotkey (Option+Space) ────────────────────────────────
 
     def _start_hotkey_listener(self) -> None:
-        """Use NSEvent global monitor instead of pynput CGEventTap.
+        """Start Option+Space hotkey handling.
 
-        NSEvent monitors observe events after they've been dispatched,
-        so they don't interfere with other apps' keyboard shortcuts
-        (ShiftIt, BetterTouchTool, etc.).
+        Preferred path is a CGEventTap keyboard listener which can swallow
+        Option+Space before it reaches the focused app.
+        Fallback path is an NSEvent global monitor (cannot suppress chars).
         """
         if self._hotkey_listener is not None:
             try:
@@ -947,35 +1025,153 @@ class ClickSpeakApp(rumps.App):
                 pass
             self._hotkey_listener = None
 
-        if self._accessibility_trusted is not True or self._input_monitoring_authorized is not True:
-            logger.warning("Permissions not confirmed (accessibility=%s, input_monitoring=%s), attempting listener anyway",
-                           self._accessibility_trusted, self._input_monitoring_authorized)
+        if self._hotkey_event_tap is not None:
+            try:
+                cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+                cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+                cg.CGEventTapEnable(self._hotkey_event_tap, False)
+            except Exception:
+                pass
+            self._hotkey_event_tap = None
+            self._hotkey_event_tap_callback = None
 
-        # NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged
-        mask = (1 << 10) | (1 << 11) | (1 << 12)
+        self._hotkey_space_active = False
+
+        if self._accessibility_trusted is not True or self._input_monitoring_authorized is not True:
+            logger.warning(
+                "Permissions not confirmed (accessibility=%s, input_monitoring=%s), attempting listener anyway",
+                self._accessibility_trusted,
+                self._input_monitoring_authorized,
+            )
+
+        try:
+            cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+            cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+
+            # kCGEventTapCallback
+            CALLBACK = ctypes.CFUNCTYPE(
+                ctypes.c_void_p,   # CGEventRef return (NULL to swallow)
+                ctypes.c_void_p,   # CGEventTapProxy
+                ctypes.c_uint32,   # CGEventType
+                ctypes.c_void_p,   # CGEventRef
+                ctypes.c_void_p,   # userInfo
+            )
+
+            # Constants (kept local to avoid hard dependency on pyobjc Quartz wrappers)
+            KEY_DOWN = 10
+            KEY_UP = 11
+            KEYCODE_FIELD = 9
+            OPTION_FLAG_MASK = 1 << 19
+            SPACE_KEYCODE = 49
+
+            cg.CGEventGetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            cg.CGEventGetIntegerValueField.restype = ctypes.c_int64
+            cg.CGEventGetFlags.argtypes = [ctypes.c_void_p]
+            cg.CGEventGetFlags.restype = ctypes.c_uint64
+
+            def _hotkey_callback(_proxy, event_type, event, _user_info):
+                if event_type not in (KEY_DOWN, KEY_UP):
+                    return event
+
+                key_code = int(cg.CGEventGetIntegerValueField(event, KEYCODE_FIELD))
+                if key_code != SPACE_KEYCODE:
+                    return event
+
+                if event_type == KEY_UP:
+                    was_active = self._hotkey_space_active
+                    self._hotkey_space_active = False
+                    if was_active:
+                        return None
+                    return event
+
+                flags = int(cg.CGEventGetFlags(event))
+                option_held = bool(flags & OPTION_FLAG_MASK)
+                if not option_held:
+                    return event
+
+                if not self._hotkey_space_active:
+                    self._hotkey_space_active = True
+                    self._run_on_main(self._handle_hotkey)
+
+                # Suppress Option+Space so it cannot insert/delete text
+                # in whichever app currently has focus.
+                return None
+
+            self._hotkey_event_tap_callback = CALLBACK(_hotkey_callback)
+
+            # kCGHIDEventTap=0, kCGHeadInsertEventTap=0, kCGEventTapOptionDefault=0
+            key_mask = (1 << KEY_DOWN) | (1 << KEY_UP)
+            cg.CGEventTapCreate.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint64,
+                CALLBACK,
+                ctypes.c_void_p,
+            ]
+            cg.CGEventTapCreate.restype = ctypes.c_void_p
+
+            tap = cg.CGEventTapCreate(0, 0, 0, key_mask, self._hotkey_event_tap_callback, None)
+            if not tap:
+                raise RuntimeError("CGEventTapCreate returned null")
+
+            self._hotkey_event_tap = tap
+
+            cf.CFMachPortCreateRunLoopSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+            cf.CFMachPortCreateRunLoopSource.restype = ctypes.c_void_p
+            source = cf.CFMachPortCreateRunLoopSource(None, tap, 0)
+            if not source:
+                raise RuntimeError("CFMachPortCreateRunLoopSource returned null")
+
+            def _run_tap() -> None:
+                try:
+                    cf.CFRunLoopGetCurrent.restype = ctypes.c_void_p
+                    cf.CFRunLoopAddSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+                    common_modes = ctypes.c_void_p.in_dll(cf, "kCFRunLoopCommonModes")
+                    loop = cf.CFRunLoopGetCurrent()
+                    cf.CFRunLoopAddSource(loop, source, common_modes)
+                    cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+                    cg.CGEventTapEnable(tap, True)
+                    cf.CFRunLoopRun.restype = None
+                    cf.CFRunLoopRun()
+                except Exception:
+                    logger.exception("Hotkey event tap run loop failed")
+
+            t = threading.Thread(target=_run_tap, daemon=True)
+            t.start()
+            logger.info("Hotkey listener started (CGEventTap, Option+Space suppression active)")
+            return
+
+        except Exception:
+            logger.exception("Failed to start CGEventTap hotkey listener; falling back to NSEvent monitor")
+            self._hotkey_event_tap = None
+            self._hotkey_event_tap_callback = None
+
+        # Fallback: detects Option+Space, but cannot suppress text insertion.
+        # We intentionally do NOT synthesize backspace here to avoid destructive side effects.
+        mask = (1 << 10) | (1 << 11) | (1 << 12)  # keyDown | keyUp | flagsChanged
 
         try:
             def _handle_ns_event(event):
                 event_type = event.type()
                 if event_type == 12:  # NSEventTypeFlagsChanged
-                    # NSEventModifierFlagOption = 1 << 19
                     self._option_held = bool(event.modifierFlags() & (1 << 19))
                 elif event_type == 10:  # NSEventTypeKeyDown
                     if self._option_held and event.keyCode() == 49:  # Space
                         if not self._hotkey_space_active:
                             self._hotkey_space_active = True
-                            self._consume_hotkey_char()
                             self._handle_hotkey()
                 elif event_type == 11:  # NSEventTypeKeyUp
                     if event.keyCode() == 49:  # Space
                         self._hotkey_space_active = False
 
             self._hotkey_listener = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-                mask, _handle_ns_event,
+                mask,
+                _handle_ns_event,
             )
-            logger.info("Hotkey listener started (NSEvent global monitor)")
+            logger.warning("Hotkey listener started (NSEvent fallback; Option+Space char suppression unavailable)")
         except Exception:
-            logger.exception("Failed to start hotkey listener")
+            logger.exception("Failed to start fallback hotkey listener")
             self._hotkey_listener = None
 
     def _handle_hotkey(self) -> None:
@@ -1011,23 +1207,6 @@ class ClickSpeakApp(rumps.App):
             return
         logger.info("HOTKEY: starting recording")
         self._start_recording()
-
-    def _consume_hotkey_char(self) -> None:
-        """Send a backspace to remove the character Option+Space inserts."""
-        from Quartz import CGEventCreateKeyboardEvent, CGEventPost, CGEventSetFlags, kCGHIDEventTap
-        def _clear():
-            time.sleep(0.01)
-            try:
-                # kVK_Delete (backspace) = 0x33
-                down = CGEventCreateKeyboardEvent(None, 0x33, True)
-                CGEventSetFlags(down, 0)
-                up = CGEventCreateKeyboardEvent(None, 0x33, False)
-                CGEventSetFlags(up, 0)
-                CGEventPost(kCGHIDEventTap, down)
-                CGEventPost(kCGHIDEventTap, up)
-            except Exception:
-                pass
-        threading.Thread(target=_clear, daemon=True).start()
 
     # ── Scroll wheel speed modifier ────────────────────────
 
@@ -1146,14 +1325,15 @@ class ClickSpeakApp(rumps.App):
                 if event.buttonNumber() != 2:
                     return
                 event_type = event.type()
+                click_count = event.clickCount()
                 loc = event.locationInWindow()
                 screen_h = NSScreen.mainScreen().frame().size.height
                 x, y = loc.x, screen_h - loc.y
 
                 if event_type == 25:  # NSEventTypeOtherMouseDown
-                    self._on_middle_mouse(x, y, pressed=True)
+                    self._on_middle_mouse(x, y, pressed=True, click_count=click_count)
                 elif event_type == 26:  # NSEventTypeOtherMouseUp
-                    self._on_middle_mouse(x, y, pressed=False)
+                    self._on_middle_mouse(x, y, pressed=False, click_count=click_count)
 
             self._mouse_listener = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
                 mask, _handle_mouse_event,
@@ -1163,7 +1343,7 @@ class ClickSpeakApp(rumps.App):
             logger.exception("Failed to start mouse listener")
             self._mouse_listener = None
 
-    def _on_middle_mouse(self, x: float, y: float, pressed: bool) -> None:
+    def _on_middle_mouse(self, x: float, y: float, pressed: bool, click_count: int = 1) -> None:
         if not self.config.middle_mouse_fast_scroll_enabled:
             return
         if pressed:
@@ -1175,7 +1355,38 @@ class ClickSpeakApp(rumps.App):
             self._middle_mouse_down = False
             self._middle_mouse_stop_scroll_monitor()
             if not self._middle_mouse_scroll_mode:
-                self._handle_hotkey()
+                self._queue_middle_click_toggle(click_count)
+
+    def _cancel_middle_click_timer(self) -> None:
+        with self._middle_click_lock:
+            timer = self._middle_click_timer
+            self._middle_click_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _queue_middle_click_toggle(self, click_count: int) -> None:
+        count = click_count if click_count >= 1 else 1
+
+        if count >= 2:
+            self._cancel_middle_click_timer()
+            logger.info("Middle double-click detected — ignoring")
+            return
+
+        self._cancel_middle_click_timer()
+        timer: threading.Timer | None = None
+
+        def _fire():
+            with self._middle_click_lock:
+                if self._middle_click_timer is not timer:
+                    return
+                self._middle_click_timer = None
+            self._run_on_main(self._handle_hotkey)
+
+        timer = threading.Timer(self._middle_click_delay_s, _fire)
+        timer.daemon = True
+        with self._middle_click_lock:
+            self._middle_click_timer = timer
+        timer.start()
 
     def _middle_mouse_start_scroll_monitor(self) -> None:
         """Direct-mapped fast scroll matching drtic-macos-app FastScrollView.
@@ -1271,6 +1482,8 @@ class ClickSpeakApp(rumps.App):
             if self._recording or self.config.trigger_mode in ("wake_word", "both"):
                 self.wake_word.process(chunk)
             if self._recording:
+                if self.audio.last_peak > 0.0:
+                    self._recording_had_nonzero_audio = True
                 self.vad.process(chunk)
         except Exception:
             logger.exception("Audio processing error")
@@ -1303,20 +1516,28 @@ class ClickSpeakApp(rumps.App):
         self.wake_word.reset()
         self.wake_word.set_cooldown(1.5)  # let initial utterance pass
         self.wake_word.set_threshold(0.3)  # lower threshold during recording for easier stop
+        self._recording_started_at = time.monotonic()
+        self._recording_had_nonzero_audio = False
+        self._recording_interrupted_by_device_loss = False
         self.audio.start_recording()
+        self._start_recording_watchdog()
         self._play_sound("Glass")
         self._set_status("Recording...")
         self._set_icon("recording")
 
-    def _on_speech_end(self) -> None:
+    def _on_speech_end(self, device_lost: bool = False) -> None:
         if not self._recording:
             return
         self._recording = False
+        self._stop_recording_watchdog()
         self.vad.enabled = False
         self.wake_word.set_threshold(self.config.wake_word_threshold)  # restore normal threshold
         audio = self.audio.stop_recording()
         self._archive_capture_audio(audio)
-        self._play_sound("Funk")
+        if device_lost:
+            self._play_sound("Basso")
+        else:
+            self._play_sound("Funk")
         logger.info("SPEECH_END: captured %d samples (%.1fs)", len(audio), len(audio) / self.config.sample_rate if len(audio) > 0 else 0)
 
         # Restore volume if it was boosted for HFP compensation
@@ -1325,11 +1546,15 @@ class ClickSpeakApp(rumps.App):
         # On-demand mode: close the audio stream immediately so macOS
         # can switch BT headphones back to A2DP (high quality) faster.
         # The audio data is already in memory — mic is no longer needed.
-        if self.config.trigger_mode not in ("wake_word", "both"):
+        if self.config.trigger_mode not in ("wake_word", "both") or device_lost:
             self._stop_listening()
 
         if len(audio) == 0:
-            self._set_status("No speech captured")
+            if device_lost and self.config.audio_device:
+                self._set_status(f"Waiting for {self.config.audio_device}...")
+                self._set_icon("idle")
+            else:
+                self._set_status("No speech captured")
             self._finish_transcription()
             return
 
@@ -1368,7 +1593,12 @@ class ClickSpeakApp(rumps.App):
 
     def _finish_transcription(self) -> None:
         self._transcribing = False
-        if self.config.trigger_mode in ("wake_word", "both") and self._listening:
+        if self._recording_interrupted_by_device_loss and self.config.audio_device:
+            self._recording_interrupted_by_device_loss = False
+            self._set_status(f"Waiting for {self.config.audio_device}...")
+            self.icon = self._icon_paths.get("idle")
+            self.template = True
+        elif self.config.trigger_mode in ("wake_word", "both") and self._listening:
             # Keep stream open for wake word detection
             self.wake_word.enabled = True
             self.wake_word.reset()
@@ -1459,11 +1689,20 @@ class ClickSpeakApp(rumps.App):
         except Exception:
             pass
         try:
+            if self._hotkey_event_tap is not None:
+                cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+                cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+                cg.CGEventTapEnable(self._hotkey_event_tap, False)
+        except Exception:
+            pass
+        try:
             if self._mouse_listener is not None:
                 NSEvent.removeMonitor_(self._mouse_listener)
         except Exception:
             pass
         self._middle_mouse_stop_scroll_monitor()
+        self._cancel_middle_click_timer()
+        self._stop_recording_watchdog()
         if self._device_poll_timer is not None:
             self._device_poll_timer.cancel()
         try:
